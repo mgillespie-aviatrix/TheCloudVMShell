@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+import boto3
+import os
+import sys
+import re
+import sqlite3
+import configparser
+import logging
+import base64
+
+from azure.identity import ClientSecretCredential
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.network import NetworkManagementClient
+
+from simple_term_menu import TerminalMenu
+
+class CloudVMShell:
+    
+    def __init__(self):
+        print (os.getenv('HOME'))
+        self.sqlite_con = sqlite3.connect("%s/cloudvm_shell.db" % os.getenv('HOME'))
+        self.sqlite_cur = self.sqlite_con.cursor()
+        self.boto3 = boto3.client('ec2')
+
+    def display_logo(self):
+        it="G1swOzE7MzQ7OTRt4paA4pab4paY4paMG1swbSAgICAgIBtbMDsxOzM0Ozk0beKWnuKWgOKWluKWnBtbMG0gICAgICAgICAbWzA7MzRt4paM4paMG1swbSAbWzA7MzRt4paM4paZ4paX4paMG1swbSAbWzA7MzRt4paeG1swOzM3beKWgOKWluKWjBtbMG0gICAgIBtbMDszN23ilpzilpwbWzBtIAogG1swOzE7MzQ7OTRt4paMG1swbSAbWzA7MTszNDs5NG3ilpviloDilpbilp7iloAbWzA7MzRt4paWG1swbSAbWzA7MzRt4paMG1swbSAgG1swOzM0beKWkBtbMG0gG1swOzM0beKWnuKWgOKWluKWjBtbMG0gG1swOzM0beKWjOKWnuKWgOKWjBtbMDszN23ilprilpfilpjilozilpjilowbWzBtIBtbMDszN23ilpriloQbWzBtIBtbMDszN23ilpviloDilpbilp7iloDilpYbWzA7MTszMDs5MG3ilpDilpAbWzBtIAogG1swOzM0beKWjBtbMG0gG1swOzM0beKWjBtbMG0gG1swOzM0beKWjOKWm+KWgBtbMG0gIBtbMDszNG3ilowbWzBtIBtbMDszNG3ilpbilpAbWzBtIBtbMDszNG3ilowbWzBtIBtbMDszN23ilozilowbWzBtIBtbMDszN23ilozilowbWzBtIBtbMDszN23ilozilp3ilp4bWzBtIBtbMDszN23ilowbWzBtIBtbMDszN23ilowbWzBtIBtbMDszN23ilpYbWzBtIBtbMDsxOzMwOzkwbeKWjOKWjBtbMG0gG1swOzE7MzA7OTBt4paM4pab4paAG1swbSAbWzA7MTszMDs5MG3ilpDilpAbWzBtIAogG1swOzM0beKWmBtbMG0gG1swOzM0beKWmBtbMG0gG1swOzM0beKWmOKWneKWgBtbMDszN23ilpgbWzBtIBtbMDszN23ilp3iloAbWzBtICAbWzA7Mzdt4paY4pad4paAG1swbSAbWzA7Mzdt4pad4paA4paY4pad4paA4paYG1swbSAbWzA7MTszMDs5MG3ilpgbWzBtIBtbMDsxOzMwOzkwbeKWmBtbMG0gG1swOzE7MzA7OTBt4paYG1swbSAbWzA7MTszMDs5MG3ilp3iloAbWzBtIBtbMDsxOzMwOzkwbeKWmBtbMG0gG1swOzE7MzA7OTBt4paY4pad4paA4paYG1swbSAbWzA7MTszNDs5NG3ilpjilpgbWzBtCkJ5IE1hdHRoZXcgR2lsbGVzcGllCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQo="
+        print("%s" % base64.b64decode(it).decode())
+        
+
+    def configure_azure(self):
+        tenant_id = input("Enter your Tenant ID: ")
+        client_id = input("Enter your Client ID: ")
+        client_secret = input ("Enter your Client Secret: ")
+        subscription_id = input ("Enter your Subscription ID: ")
+        resource_group = input("Enter your default Resource Group: ")
+        ssh_keyname = input("Enter your default SSH Key: ")
+        self.sqlite_cur.execute("INSERT into cloud_provider_config_azure (tenant_id, client_id, client_secret, subscription_id, resource_group, ssh_keyname) VALUES ('%s', '%s', '%s', '%s','%s', '%s')" % (tenant_id, client_id, client_secret, subscription_id, resource_group, ssh_keyname))
+        self.sqlite_con.commit()
+
+
+
+    def insert_vm_into_db(self, cloud_provider, region_name, instance_name, id, private_ip_address, public_ip_address):
+        self.sqlite_cur.execute("INSERT OR IGNORE into vm_instances VALUES (%d, '%s','%s', '%s', '%s', '%s')" % (cloud_provider, region_name, instance_name, id, private_ip_address, public_ip_address))
+        self.sqlite_con.commit()
+
+
+    def refresh_azurevm_instances(self):
+        self.sqlite_cur.execute("SELECT * FROM cloud_provider_config_azure")
+        sqlite_rows = self.sqlite_cur.fetchall()
+        tenant_id = sqlite_rows[0][1]
+        client_id = sqlite_rows[0][2]
+        client_secret = sqlite_rows[0][3]
+        subscription_id = sqlite_rows[0][4]
+        resource_group = sqlite_rows[0][5]
+
+
+        credential = ClientSecretCredential(
+            tenant_id=tenant_id,
+            client_id=client_id,
+            client_secret=client_secret
+        )
+
+        compute_client = ComputeManagementClient(
+            credential=credential,
+            subscription_id=subscription_id
+        )
+
+        network_client = NetworkManagementClient(credential,subscription_id)
+        
+        for vm in compute_client.virtual_machines.list_all():
+            vm_name = vm.name
+            vm_location = vm.location
+            vm_id = vm.vm_id
+            nic_name = vm.network_profile.network_interfaces[0].id.rsplit('/',1)[1]
+            ip_conf = network_client.network_interfaces.get(resource_group, nic_name ).ip_configurations
+
+            for ip in ip_conf:
+                if ip.private_ip_address:
+                    private_ip = ip.private_ip_address
+                if ip.public_ip_address:
+                    name = " ".join(ip.public_ip_address.id.split('/')[-1:])
+                    sub = "".join(ip.public_ip_address.id.split('/')[4])
+                    public_ip = network_client.public_ip_addresses.get(sub, name).ip_address
+                    
+
+            print("Instance is %s %s %s %s" % (vm_name, vm_id, private_ip, public_ip))
+            self.insert_vm_into_db(2, vm_location, vm_name, vm_id, private_ip, public_ip)
+
+
+
+    def refresh_ec2_instances(self):
+        region_lookup = self.boto3.describe_regions()
+        response_dict = {}
+
+        #First we loop through all of the available regions to ensure we review all instances.
+        for r in region_lookup['Regions']:
+            print("Region is %s" % r)
+            #Search for ec2 instances in the region for our defined tag.
+            #filters=[{'Name' : 'tag:Automated-Shutdown-Enabled', 'Values': ['true']}]
+            filters=[{'Name': 'instance-state-name', 'Values': ['running']}]
+            ec2_lookup = boto3.resource('ec2', region_name=r['RegionName'])
+            instances = ec2_lookup.instances.filter(Filters=filters)
+        
+
+
+            #Loop through each instance matching the "Automated-Shutdown-Enabled = true" tag.
+            for i in instances:
+                #Determine name tag for this instance.
+                instance_name = "Unnamed Instance"
+                for tag in i.tags:
+                    if 'Name' in tag['Key']:
+                        instance_name = tag['Value']
+                        break
+                
+                #We establish a dict to report back to the end-user the before/after state of each VM.
+                instance_dict = {}
+                instance_dict["id"] = i.id
+                instance_dict["name"] = instance_name
+                instance_dict["previous_state"] = i.state
+
+                print("Instance is %s %s %s %s" % (instance_name, i.id, i.private_ip_address, i.public_ip_address))
+
+                self.insert_vm_into_db(1, r['RegionName'], instance_name, i.id, i.private_ip_address, i.public_ip_address)
+
+    
+
+    def build_menu_list(self, include_configure = True):
+    
+        if include_configure: 
+            menu_list = ["Configure"]
+        else:    
+            menu_list = []
+
+        self.sqlite_cur.execute("SELECT * FROM vm_instances")
+        sqlite_rows = self.sqlite_cur.fetchall()
+
+        for row in sqlite_rows:
+            menu_list.append("[%s] %s (%s) %s %s %s" % (row[0], row[1], row[2], row[3], row[4], row[5]))
+
+        menu_list.append("Exit")
+        return menu_list
+
+    def tablecheck(self):    
+        self.sqlite_cur.execute("CREATE TABLE IF NOT EXISTS vm_instances (cloud_provider INTEGER, region text, name text, id text PRIMARY KEY, private_ip text, public_ip text)")    
+        self.sqlite_cur.execute("CREATE TABLE IF NOT EXISTS cloud_provider (id INTEGER PRIMARY KEY AUTOINCREMENT, name text)") 
+        self.sqlite_cur.execute("INSERT OR IGNORE INTO cloud_provider VALUES (1, 'AWS')")
+        self.sqlite_cur.execute("INSERT OR IGNORE INTO cloud_provider VALUES (2, 'Azure')")
+        self.sqlite_cur.execute("INSERT OR IGNORE INTO cloud_provider VALUES (3, 'GCP')")
+        self.sqlite_cur.execute("INSERT OR IGNORE INTO cloud_provider VALUES (4, 'Oracle')")
+        self.sqlite_cur.execute("INSERT OR IGNORE INTO cloud_provider VALUES (5, 'Alibaba')")
+        self.sqlite_cur.execute("CREATE TABLE IF NOT EXISTS cloud_provider_config_azure (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id text, client_id text, client_secret text, subscription_id text, resource_group text, ssh_keyname text)") 
+        
+
+        #@todo: Refactor this into a real workflow
+        #self.sqlite_cur.execute("INSERT into cloud_provider_config_azure (tenant_id, client_id, client_secret, subscription_id, resource_group, ssh_keyname) VALUES ('%s', '%s', '%s', '%s','%s', '%s')" % (TENANT_ID, CLIENT_ID, CLIENT_SECRET, SUBSCRIPTION_ID, RESOURCE_GROUP, "AWSVMKey.pem"))
+
+        self.sqlite_con.commit()
+
+    def droptables(self):
+        self.sqlite_cur.execute("DROP TABLE IF EXISTS vm_instances")
+        self.sqlite_cur.execute("DROP TABLE IF EXISTS cloud_provider")
+        self.sqlite_cur.execute("DROP TABLE IF EXISTS cloud_provider_config_azure")
+        self.sqlite_con.commit()
+
+
+
+    def configuration_menu(self):
+        #Display the logo
+        os.system("clear")
+        self.display_logo()      
+        menu_list = ["Refresh EC2 List", "Refresh Azure List", "Refresh all VMs", "Configure AWS", "Configure Azure", "Show Configuration", "Delete Database"]
+        
+        terminal_menu = TerminalMenu(menu_list)
+        menu_entry_index = terminal_menu.show()
+        print(f"You have selected {menu_list[menu_entry_index]}...")
+
+        if menu_list[menu_entry_index] == "Configure Azure":
+            self.configuration_menu_select_sshkey()
+            #self.configure_azure()
+        elif menu_list[menu_entry_index] == "Refresh EC2 List":
+            self.refresh_ec2_instances()
+        elif menu_list[menu_entry_index] == "Refresh Azure List":
+            self.refresh_azurevm_instances()
+        elif menu_list[menu_entry_index] == "Refresh all VMs":
+            self.refresh_ec2_instances()
+            self.refresh_azurevm_instances()
+        elif menu_list[menu_entry_index] == "Delete Database":
+            reply = input("Are you sure you want to delete the database? Type 'yes' to confirm ")
+            if reply == "yes":
+                self.droptables()
+                self.tablecheck()
+                input("Database has been rebuilt from scratch. Please reconfigure your settings.... (press enter to continue)")
+            else:
+                input("Database is not being altered (press enter to continue)")
+
+    def configuration_menu_select_sshkey(self):
+        path = "%s/.ssh" % os.getenv('HOME')
+        menu_list = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path,f))]
+
+        print("Please select an SSH key for this connection")
+
+        terminal_menu = TerminalMenu(menu_list)
+        menu_entry_index = terminal_menu.show()
+        print(f"You have selected {menu_list[menu_entry_index]}...")
+    
+
+
+        
+    def shell(self):
+        
+        #Check to ensure the table exists.
+        self.tablecheck()
+
+
+        while True:
+            #Display the logo
+            os.system("clear")
+            self.display_logo()
+
+            #Build the menu list and begin the interactive prompt
+            menu_list=self.build_menu_list()    
+            terminal_menu = TerminalMenu(menu_list)
+            menu_entry_index = terminal_menu.show()
+            print(f"You have selected {menu_list[menu_entry_index]}...")
+
+            if menu_list[menu_entry_index] == "Refresh ec2 list":
+                self.refresh_ec2_instances()
+                self.refresh_azurevm_instances()
+                self.shell()
+            elif menu_list[menu_entry_index] == "Exit":
+                sys.exit(0)
+            elif menu_list[menu_entry_index] == "Configure":
+                self.configuration_menu()
+            else:
+                ip_search = re.match(".*?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$", menu_list[menu_entry_index])
+                if ip_search:
+                    ip=ip_search.group(1)
+                    os.system("ssh -v -l ec2-user %s"  % ip)
+                    sys.exit(0)
+                else:
+                    # Here we do a jump proxy
+                    print("\n\nThis host has no public IP. Please select a system to use for proxying access:\n")
+                    ip_search = re.match(".*?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+None", menu_list[menu_entry_index])
+                    if ip_search:
+                        private_ip=ip_search.group(1)
+
+                    menu_list=self.build_menu_list(False)    
+                    terminal_menu = TerminalMenu(menu_list)
+                    menu_entry_index = terminal_menu.show()
+                    print(f"You have selected {menu_list[menu_entry_index]}...by means of {private_ip}")
+                    ip_search = re.match(".*?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$", menu_list[menu_entry_index])
+                    if ip_search:
+                        ip=ip_search.group(1)
+                    input("Press enter to connect...")
+                    os.system("ssh -v -J ec2-user@%s ec2-user@%s " % (ip, private_ip))
+                    sys.exit(0)
+
+
+
+
+if __name__ == "__main__":
+    ec2_shell = CloudVMShell()
+    ec2_shell.shell()
+    
+
